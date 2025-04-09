@@ -13,7 +13,7 @@
 //
 // You should have received a copy of the GNU Lesser General Public License
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
-// bug across the entire project files fixed and high tx per block feature added  by EtherAuthority <https://etherauthority.io/>
+// bug across the entire project files fixed by EtherAuthority <https://etherauthority.io/>
 
 package core
 
@@ -109,7 +109,7 @@ func (v *BlockValidator) ValidateState(block *types.Block, statedb *state.StateD
 	// Validate the state root against the received state root and throw
 	// an error if they don't match.
 	if root := statedb.IntermediateRoot(v.config.IsEIP158(header.Number)); header.Root != root {
-		// return fmt.Errorf("invalid merkle root (remote: %x local: %x)", header.Root, root)
+		return fmt.Errorf("invalid merkle root (remote: %x local: %x)", header.Root, root)
 	}
 	return nil
 }

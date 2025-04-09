@@ -792,124 +792,115 @@ func (w *worker) commitTransaction(tx *types.Transaction, coinbase common.Addres
 	return receipt.Logs, nil
 }
 
-
-
-
-
 func (w *worker) commitTransactions(txs *types.TransactionsByPriceAndNonce, coinbase common.Address, interrupt *int32) bool {
-    if w.current == nil {
-        return true
-    }
+	// Short circuit if current is nil
+	if w.current == nil {
+		return true
+	}
 
-    gasLimit := w.current.header.GasLimit
-    if w.current.gasPool == nil {
-        w.current.gasPool = new(core.GasPool).AddGas(gasLimit)
-    }
+	gasLimit := w.current.header.GasLimit
+	if w.current.gasPool == nil {
+		w.current.gasPool = new(core.GasPool).AddGas(gasLimit)
+	}
 
-    var coalescedLogs []*types.Log
-    iterationCount := 0
-    const maxTransactions = 505000
-    const maxIterations = 550000
-    const interruptIterationThreshold = 510000
+	var coalescedLogs []*types.Log
+	iterationCount := 0
+	
+	for {
+		iterationCount++
+		if interrupt != nil {
+			interruptVal := atomic.LoadInt32(interrupt)
+			if interruptVal != commitInterruptNone {
+				if interruptVal == commitInterruptResubmit {
+					ratio := float64(gasLimit-w.current.gasPool.Gas()) / float64(gasLimit)
+					if ratio < 0.1 {
+						ratio = 0.1
+					}
+					w.resubmitAdjustCh <- &intervalAdjust{
+						ratio: ratio,
+						inc:   true,
+					}
+				}
+				return interruptVal == commitInterruptNewHead
+			}
+		}
 
-    interruptCheck := func() bool {
-        if interrupt != nil {
-            // Delay the interrupt check if transactions exist and iterations are below the threshold
-            if iterationCount < interruptIterationThreshold && txs.Peek() != nil {
-                return false
-            }
+		blockNumber := w.current.header.Number.Uint64()
+		if blockNumber%2 != 0 {
+			const maxTransactions = 250000
+			if w.current.tcount >= maxTransactions {
+				log.Trace("Maximum number of transactions reached", "tcount", w.current.tcount, "max", maxTransactions)
+				break
+			}
+		} else {
+			if w.current.gasPool.Gas() < params.TxGas {
+				log.Trace("Not enough gas for further transactions", "have", w.current.gasPool, "want", params.TxGas)
+				break
+			}
+		}
 
-            interruptVal := atomic.LoadInt32(interrupt)
-            if interruptVal != commitInterruptNone {
-                if interruptVal == commitInterruptResubmit {
-                    ratio := float64(gasLimit-w.current.gasPool.Gas()) / float64(gasLimit)
-                    if ratio < 0.1 {
-                        ratio = 0.1
-                    }
-                    w.resubmitAdjustCh <- &intervalAdjust{
-                        ratio: ratio,
-                        inc:   true,
-                    }
-                }
-                return interruptVal == commitInterruptNewHead
-            }
-        }
-        return false
-    }
+		tx := txs.Peek()
+		if tx == nil || iterationCount > 10000000 {
+			break
+		}
 
-    for iterationCount = 0; iterationCount < maxIterations; iterationCount++ {
-        if interruptCheck() {
-            log.Info("Iteration interrupted", "iterationCount", iterationCount)
-            return false
-        }
+		from, _ := types.Sender(w.current.signer, tx)
+		if tx.Protected() && !w.chainConfig.IsEIP155(w.current.header.Number) {
+			log.Trace("Ignoring replay protected transaction", "hash", tx.Hash(), "eip155", w.chainConfig.EIP155Block)
+			txs.Pop()
+			continue
+		}
 
-        if w.current.tcount >= maxTransactions || w.current.gasPool.Gas() < params.TxGas {
-            log.Info("Exiting loop", "reason", "Gas limit or max transactions reached", "iterationCount", iterationCount)
-            break
-        }
+		if w.isPoSA {
+			if err := w.posa.ValidateTx(from, tx, w.current.header, w.current.state); err != nil {
+				log.Trace("Ignoring consensus invalid transaction", "hash", tx.Hash().String(), "from", from.String(), "to", tx.To(), "err", err)
+				txs.Pop()
+				continue
+			}
+		}
 
-        tx := txs.Peek()
-        if tx == nil {
-            log.Info("Exiting loop", "reason", "No more transactions", "iterationCount", iterationCount)
-            break
-        }
+		w.current.state.Prepare(tx.Hash(), w.current.tcount)
+		logs, err := w.commitTransaction(tx, coinbase)
 
-        from, _ := types.Sender(w.current.signer, tx)
-        if tx.Protected() && !w.chainConfig.IsEIP155(w.current.header.Number) {
-            txs.Pop()
-            continue
-        }
+		if err != nil {
+			if errors.Is(err, core.ErrGasLimitReached) {
+				log.Trace("Gas limit exceeded for current block", "sender", from)
+				txs.Pop()
+			} else if errors.Is(err, core.ErrNonceTooLow) {
+				log.Trace("Skipping transaction with low nonce", "sender", from, "nonce", tx.Nonce())
+				txs.Shift()
+			} else if errors.Is(err, core.ErrNonceTooHigh) {
+				log.Trace("Skipping account with high nonce", "sender", from, "nonce", tx.Nonce())
+				txs.Pop()
+			} else if errors.Is(err, core.ErrTxTypeNotSupported) {
+				log.Trace("Skipping unsupported transaction type", "sender", from, "type", tx.Type())
+				txs.Pop()
+			} else {
+				log.Debug("Transaction failed, account skipped", "hash", tx.Hash(), "err", err)
+				txs.Shift()
+			}
+			continue
+		}
 
-        if w.isPoSA {
-            if err := w.posa.ValidateTx(from, tx, w.current.header, w.current.state); err != nil {
-                txs.Pop()
-                continue
-            }
-        }
+		coalescedLogs = append(coalescedLogs, logs...)
+		w.current.tcount++
+		txs.Shift()
+	}
 
-        w.current.state.Prepare(tx.Hash(), w.current.tcount)
-        logs, err := w.commitTransaction(tx, coinbase)
+	if !w.isRunning() && len(coalescedLogs) > 0 {
+		cpy := make([]*types.Log, len(coalescedLogs))
+		for i, l := range coalescedLogs {
+			cpy[i] = new(types.Log)
+			*cpy[i] = *l
+		}
+		w.pendingLogsFeed.Send(cpy)
+	}
 
-        if err != nil {
-            switch {
-            case errors.Is(err, core.ErrGasLimitReached):
-                txs.Pop()
-            case errors.Is(err, core.ErrNonceTooLow):
-                txs.Shift()
-            case errors.Is(err, core.ErrNonceTooHigh):
-                txs.Pop()
-            case errors.Is(err, core.ErrTxTypeNotSupported):
-                txs.Pop()
-            default:
-                txs.Shift()
-            }
-            continue
-        }
-
-        coalescedLogs = append(coalescedLogs, logs...)
-        w.current.tcount++
-        txs.Shift()
-    }
-
-    log.Info("Completed commitTransactions", "iterationCount", iterationCount)
-
-    if !w.isRunning() && len(coalescedLogs) > 0 {
-        w.pendingLogsFeed.Send(coalescedLogs)
-    }
-
-    if interrupt != nil {
-        w.resubmitAdjustCh <- &intervalAdjust{inc: false}
-    }
-    return false
+	if interrupt != nil {
+		w.resubmitAdjustCh <- &intervalAdjust{inc: false}
+	}
+	return false
 }
-
-
-
-
-
-
-
-
 
 
 // commitNewWork generates several new sealing tasks based on the parent block.

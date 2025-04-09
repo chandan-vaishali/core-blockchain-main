@@ -13,7 +13,7 @@
 //
 // You should have received a copy of the GNU Lesser General Public License
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
-// bug across the entire project files fixed and high tx per block feature added  by EtherAuthority <https://etherauthority.io/>
+// bug across the entire project files fixed by EtherAuthority <https://etherauthority.io/>
 
 // Package congress implements the proof-of-stake-authority consensus engine.
 package congress
@@ -522,9 +522,9 @@ func (c *Congress) verifySeal(chain consensus.ChainHeaderReader, header *types.H
         if recent == signer {
             var limit uint64
 			limit = uint64(len(snap.Validators)/2 + 1)
-            if len(snap.Validators) > 21 || len(snap.Validators) == 1  {
+            if len(snap.Validators) > 10 {
                 limit = uint64(len(snap.Validators)/2 + 1)
-            } else {  //if number > 9299500 {  // Replace 'someGivenNumber' with the actual variable or value you want to compare against
+            } else if number > 9299500 {  // Replace 'someGivenNumber' with the actual variable or value you want to compare against
                 limit = 2
             }
             // Validator is among recents, only fail if the current block doesn't shift it out
@@ -607,14 +607,6 @@ func (c *Congress) Finalize(chain consensus.ChainHeaderReader, header *types.Hea
 			log.Error("Initialize system contracts failed", "err", err)
 			return err
 		}
-	}
-
-	// Set the base fee manually for EIP-1559 blocks
-    // Static base fee = 476,190 gwei
-	parent := chain.GetHeader(header.ParentHash, header.Number.Uint64()-1)
-    if chain.Config().IsLondon(header.Number) { // EIP-1559 is active
-		// header.BaseFee = big.NewInt(476190000000000) // 476,190 gwei
-		header.BaseFee = misc.CalcBaseFee(chain.Config(), parent)
 	}
 
 	if header.Difficulty.Cmp(diffInTurn) != 0 {
@@ -754,14 +746,6 @@ func (c *Congress) FinalizeAndAssemble(chain consensus.ChainHeaderReader, header
 		if err := c.initializeSystemContracts(chain, header, state); err != nil {
 			panic(err)
 		}
-	}
-
-	// Set the base fee manually for EIP-1559 blocks
-    // Static base fee = 476,190 gwei
-	parent := chain.GetHeader(header.ParentHash, header.Number.Uint64()-1)
-    if chain.Config().IsLondon(header.Number) { // EIP-1559 is active
-		// header.BaseFee = big.NewInt(476190000000000) // 476,190 gwei
-		header.BaseFee = misc.CalcBaseFee(chain.Config(), parent)
 	}
 
 	// punish validator if necessary
@@ -1144,9 +1128,9 @@ func (c *Congress) Seal(chain consensus.ChainHeaderReader, block *types.Block, r
   		// Determine the limit based on the number of validators
   		var limit uint64
 		limit = uint64(len(snap.Validators)/2 + 1)
-  		if len(snap.Validators) > 21 || len(snap.Validators) == 1  {
+  		if len(snap.Validators) > 10 {
   			limit = uint64(len(snap.Validators)/2 + 1)
-  		} else { //if number > 9299500 {
+  		} else if number > 9299500 {
   			limit = 2
   		}
   		// Validator is among recents, only wait if the current block doesn't shift it out
